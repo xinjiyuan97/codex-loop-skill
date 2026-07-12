@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-基于 [Codex app-server](https://github.com/openai/codex) 的 MCP 服务（`codex-mcp-server`），附带可分发的 **Codex Loop Skill**，用于在 Hermes 中编排多线程开发工作流。
+基于 [Codex app-server](https://github.com/openai/codex) 的 MCP 服务（`codex-mcp-server`），附带可分发的 **Codex Loop Skill**，用于在 Hermes 中编排多线程开发工作流（新功能、bugfix、refactor、PR review、批量 issue 修复）。
 
 **快速开始：** [安装流程](#安装流程)
 
@@ -163,12 +163,12 @@ cargo build --release
 
 ## 工作流
 
-面向 **Hermes** 的 Agent Skill，引导编排 Agent 完成以下流程：
+面向 **Hermes** 的 Agent Skill，通过 `mcp_codex_*` 工具编排 Codex 开发循环：
 
 1. 分类任务 → 创建 git 分支（`feature/`、`bugfix/`、`refactor/`）
 2. 用完整 markdown 需求调用 `mcp_codex_start` 创建 Codex 线程
 3. 校验结果 → 在同一 thread 上 `mcp_codex_reply` 修正
-4. 复杂任务按模块拆分为多个 thread
+4. 复杂任务按模块拆分为多个 thread；PR review、worktree 并行修复、批量 review 见 SKILL.md
 5. 通过 `mcp_codex_process` 和 MCP resources 跟踪进度
 
 完整工作流见 `skills/codex-loop/SKILL.md`，示例见 `skills/codex-loop/examples.md`。

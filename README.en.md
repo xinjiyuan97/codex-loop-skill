@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-MCP server (`codex-mcp-server`) wrapping [Codex app-server](https://github.com/openai/codex), plus a distributable **Codex Loop Skill** for orchestrating multi-thread development workflows in Hermes.
+MCP server (`codex-mcp-server`) wrapping [Codex app-server](https://github.com/openai/codex), plus a distributable **Codex Loop Skill** for orchestrating multi-thread development workflows in Hermes (features, bugfixes, refactors, PR reviews, batch issue fixing).
 
 **Quick start:** [Installation](#installation)
 
@@ -163,12 +163,12 @@ Environment variables:
 
 ## Workflow
 
-Hermes-oriented agent skill. Guides an orchestrator agent through:
+Hermes-oriented agent skill orchestrating Codex via `mcp_codex_*` tools:
 
 1. Classify task → create git branch (`feature/`, `bugfix/`, `refactor/`)
 2. `mcp_codex_start` Codex threads with full markdown requirements
 3. Validate results → `mcp_codex_reply` on the same thread to fix issues
-4. Split complex work across module-scoped threads
+4. Split complex work across module-scoped threads; PR reviews, parallel worktree fixes, and batch reviews — see SKILL.md
 5. Track progress via `mcp_codex_process` and MCP resources
 
 See `skills/codex-loop/SKILL.md` for the full workflow and `skills/codex-loop/examples.md` for examples.

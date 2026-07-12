@@ -1,14 +1,14 @@
 ---
 name: codex-loop
 description: >-
-  Orchestrates Codex MCP start/reply loops for new features, bugfixes, and refactors
-  via Hermes mcp_codex_* tools. Requires user-configured codex MCP in ~/.hermes/config.yaml.
-  Creates git branches, spawns threads with markdown requirements, validates and iterates
-  via reply. Use when codex MCP is ready and the task is a complete feature, bugfix,
-  refactor, or multi-module deliverable.
+  Orchestrates Codex MCP start/reply loops for new features, bugfixes, refactors,
+  PR reviews, and batch issue fixing via Hermes mcp_codex_* tools. Requires
+  user-configured codex MCP in ~/.hermes/config.yaml. Creates git branches,
+  spawns threads with markdown requirements, validates and iterates via reply.
 metadata:
   hermes:
-    related_skills: [native-mcp]
+    tags: [Coding-Agent, Codex, OpenAI, Code-Review, Refactoring]
+    related_skills: [native-mcp, claude-code, hermes-agent]
     config:
       - key: codex.approval_policy
         description: Codex MCP approval policy for command and file changes
@@ -27,6 +27,7 @@ MCP 通用说明见 **`native-mcp`** skill（`skill_view native-mcp`）。
 ## When to Use
 
 - 完整新需求、bugfix、refactor
+- PR review、批量 issue 修复
 - 需要分支隔离 + 多 thread 并行/迭代
 - `hermes mcp test codex` 通过，Agent 工具列表含 `mcp_codex_*`
 
@@ -40,9 +41,13 @@ MCP 通用说明见 **`native-mcp`** skill（`skill_view native-mcp`）。
 
 | 依赖 | 说明 |
 |------|------|
-| `codex` CLI | 宿主机 PATH 可用 |
+| `codex` CLI | 宿主机 PATH 可用（`npm install -g @openai/codex`） |
+| OpenAI auth | `OPENAI_API_KEY` 或 Codex CLI OAuth（`~/.codex/auth.json`） |
+| Git 仓库 | **必须在 git 目录内运行** — Codex 拒绝在非 repo 目录启动；scratch 工作需先 `git init` |
 | bundled binary | `<skill-root>/assets/bin/codex-mcp-server` |
 | Hermes MCP | `~/.hermes/config.yaml` 中 server **`codex`** |
+
+**Auth 说明：** Hermes 自身 `model.provider: openai-codex` 使用 `~/.hermes/auth.json`（`hermes auth add openai-codex`）。独立 Codex CLI 的 OAuth 可能在 `~/.codex/auth.json`；缺少 `OPENAI_API_KEY` 不代表 auth 缺失。
 
 | 配置项 | 位置 | 默认 |
 |--------|------|------|
@@ -106,12 +111,27 @@ mcp_servers:
 
 参数详见 [references/tools.md](references/tools.md)。**不要**使用裸名 `start`/`reply`。
 
+## Sandbox
+
+`mcp_codex_start` 的 `sandbox` 参数控制 Codex 执行环境：
+
+| 值 | 效果 |
+|----|------|
+| `danger-full-access`（默认） | 无沙箱限制，最快；适合 Hermes gateway/service 上下文 |
+| 其他 Codex 沙箱模式 | 按需收窄权限 |
+
+### Hermes Gateway Caveat
+
+从 Hermes gateway/service 上下文（如 Telegram 驱动的 agent 会话）调用时，Codex `workspace-write` 沙箱可能失败，即使同一项目在交互式 shell 中正常。典型症状：bubblewrap/user-namespace 错误，如 `setting up uid map: Permission denied`。
+
+**默认已使用 `danger-full-access`**。以进程边界作为安全层：`cwd` 限定、启动前 `git status` 干净、窄任务 prompt、`git diff` 审查、针对性测试、大范围 commit 前人工/agent 确认。
+
 ## Pitfalls
 
 - Agent 不能改 `config.yaml` — 让用户跑 `scripts/setup.sh` 或手改
 - 改 config 后未 `/reload-mcp` → 工具列表不更新
 - `hermes mcp add` 的工具勾选无法在无 TTY 环境完成 → 用户手动操作
-- 完整需求写入 `description` 而非 `prompt`
+- 完整需求写入 `prompt` 而非 `description`
 - stdio server，无 OAuth
 - `sandbox` 默认 `danger-full-access`
 
@@ -141,6 +161,8 @@ Verify MCP → Classify task → Create branch → (Split modules) → mcp_codex
 | New feature | `feature/` | `feature/user-auth` |
 | Bugfix | `bugfix/` | `bugfix/login-redirect-loop` |
 | Refactor | `refactor/` | `refactor/extract-payment-service` |
+| PR review | — | 通常不新建分支，只读 review |
+| Batch fix | `fix/` | `fix/issue-78` |
 
 Derive a short, kebab-case slug from the task title.
 
@@ -153,6 +175,8 @@ git checkout -b <prefix>/<slug>
 ```
 
 Work on this branch for the entire Codex loop. Do not mix unrelated tasks on one branch.
+
+PR review 等只读任务可跳过建分支，或在临时 clone 目录中执行。
 
 ## Step 3: Decompose Complex Tasks
 
@@ -252,6 +276,94 @@ Call **`mcp_codex_start`**:
 
 ---
 
+## Usage Patterns
+
+### PR Reviews
+
+Clone 到临时目录做安全 review，再用 `mcp_codex_start`：
+
+```bash
+REVIEW=$(mktemp -d)
+git clone https://github.com/user/repo.git $REVIEW
+cd $REVIEW && gh pr checkout 42
+```
+
+```json
+{
+  "description": "Review PR #42 against origin/main",
+  "prompt": "# PR Review #42\n\nReview the changes against `origin/main`. Run `git diff origin/main...HEAD`. Report: summary, risks, suggestions, blocking issues.",
+  "cwd": "/tmp/review-xxx",
+  "block": true
+}
+```
+
+完成后用 `gh pr comment` 发布 review 结果，再 `mcp_codex_archive`。
+
+### Parallel Issue Fixing with Worktrees
+
+```bash
+git worktree add -b fix/issue-78 /tmp/issue-78 main
+git worktree add -b fix/issue-99 /tmp/issue-99 main
+```
+
+并行启动两个 async thread：
+
+```json
+{
+  "description": "Fix issue #78",
+  "prompt": "Fix issue #78: <description>. Commit when done.",
+  "cwd": "/tmp/issue-78",
+  "block": false
+}
+```
+
+```json
+{
+  "description": "Fix issue #99",
+  "prompt": "Fix issue #99: <description>. Commit when done.",
+  "cwd": "/tmp/issue-99",
+  "block": false
+}
+```
+
+通过 `mcp_codex_process` 或 `project://` resource 轮询。完成后：
+
+```bash
+cd /tmp/issue-78 && git push -u origin fix/issue-78
+gh pr create --repo user/repo --head fix/issue-78 --title "fix: ..." --body "..."
+git worktree remove /tmp/issue-78
+```
+
+### Batch PR Reviews
+
+```bash
+git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+```
+
+并行 review 多个 PR（`block: false`）：
+
+```json
+{
+  "description": "Review PR #86",
+  "prompt": "Review PR #86. Run `git diff origin/main...origin/pr/86`. Output structured review.",
+  "cwd": "/path/to/project",
+  "block": false
+}
+```
+
+```json
+{
+  "description": "Review PR #87",
+  "prompt": "Review PR #87. Run `git diff origin/main...origin/pr/87`. Output structured review.",
+  "cwd": "/path/to/project",
+  "block": false
+}
+```
+
+各 thread 完成后 `gh pr comment` 发布，再 `mcp_codex_archive`。
+
+---
+
 ## Resource Management
 
 通过 MCP resources 管理（需 config 中 `resources: true`）。读 resource 方式见 `native-mcp`。
@@ -339,6 +451,7 @@ Same shape for async `mcp_codex_reply` — returns `thread_id` immediately, `con
 - Running **multiple module threads in parallel** on the same branch
 - Long-running tasks where you want to monitor progress without blocking
 - Orchestrator pattern: spawn threads, poll status, validate as each completes
+- Batch PR reviews, parallel worktree fixes
 
 ### Completion notification
 
@@ -501,6 +614,19 @@ Project: project://abcd1234
 | Thread detail | MCP resource read | `thread://{project_id}/{thread_id}` |
 | Clean up | `mcp_codex_archive` | `thread_id` |
 | Async completion | notification | `notifications/codex/thread/completed` |
+| PR review | `mcp_codex_start` | review prompt + temp clone `cwd` |
+| Parallel fixes | `mcp_codex_start` | worktrees + `block: false` |
+| Batch review | `mcp_codex_start` | fetch PR refs + parallel threads |
+
+## Rules
+
+1. **Git repo required** — Codex won't run outside a git directory; use `mktemp -d && git init` for scratch
+2. **Use MCP tools only** — `mcp_codex_start` / `reply` / `process` / `archive`，不用裸 CLI
+3. **`block: false` for long or parallel tasks** — monitor with `mcp_codex_process` or project resource
+4. **Don't interfere** — poll patiently, let Codex finish long turns
+5. **Parallel is fine** — multiple threads at once for batch work (worktrees, PR reviews)
+6. **Same thread for fixes** — use `mcp_codex_reply`, not a new thread
+7. **Archive when done** — keep project listings clean
 
 ## Anti-Patterns
 
@@ -511,3 +637,4 @@ Project: project://abcd1234
 - Forgetting to archive — leads to cluttered project thread listings.
 - Blocking on parallel threads — use `block: false` and poll via `mcp_codex_process` or project resource.
 - Polling only at the end — check `mcp_codex_process` or project resource while long turns are running.
+- Calling `codex` CLI directly — use MCP tools for consistent thread tracking and progress.
