@@ -1,2 +1,15 @@
-/target
-/.tmp
+/target/
+/.tmp/
+/dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local MCP / Hermes config (not part of the distributable skill)
+.cursor/
+
+# Packaged skill binaries are injected at build time
+skills/codex-loop/assets/bin/*
+!skills/codex-loop/assets/bin/.gitkeep

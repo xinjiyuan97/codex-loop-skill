@@ -3,38 +3,97 @@
 use std::collections::HashMap;
 
 use codex_app_server_sdk::api::{ThreadError, ThreadEvent, ThreadItem, UserMessageContentItem};
+use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::resources::{encode_project_id, project_uri, thread_uri};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadLifecycle {
+    /// Thread is being created.
     Starting,
+    /// A turn is currently running.
     Running,
+    /// Waiting for user approval of a command or file change.
     WaitingApproval,
+    /// The latest turn completed successfully.
     Completed,
+    /// The latest turn failed.
     Failed,
+    /// The thread was interrupted before completion.
     Interrupted,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadItemKind {
+    AgentMessage,
+    UserMessage,
+    CommandExecution,
+    FileChange,
+    McpToolCall,
+    Reasoning,
+    Plan,
+    WebSearch,
+    Error,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    CommandExecution,
+    ExecCommand,
+    ApplyPatch,
+    FileChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProcessStepKind {
+    ThreadStarted,
+    TurnStarted,
+    ItemStarted { item: ThreadItemKind },
+    ItemUpdated { item: ThreadItemKind },
+    ItemCompleted { item: ThreadItemKind },
+    TurnCompleted,
+    TurnFailed,
+    Error,
+    UserReply,
+    Approval { kind: ApprovalKind },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(description = "One step in the local thread execution trace.")]
 pub struct ProcessStep {
-    pub kind: String,
+    #[schemars(description = "Structured step kind")]
+    pub kind: ProcessStepKind,
+    #[schemars(description = "Human-readable step summary")]
     pub summary: String,
+    #[schemars(description = "Unix timestamp in seconds")]
     pub at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(description = "Local execution state tracked for a Codex thread.")]
 pub struct ThreadRecord {
+    #[schemars(description = "Codex thread id")]
     pub thread_id: String,
+    #[schemars(description = "Short stable project id derived from cwd")]
     pub project_id: String,
+    #[schemars(description = "Absolute working directory for the thread")]
     pub cwd: String,
+    #[schemars(description = "Brief task summary for calling-agent tracking and project resource listings")]
     pub description: String,
+    #[schemars(description = "Current local lifecycle status")]
     pub status: ThreadLifecycle,
+    #[schemars(description = "Ordered local execution trace")]
     pub process: Vec<ProcessStep>,
+    #[schemars(description = "Latest final agent response, if available")]
     pub final_response: Option<String>,
+    #[schemars(description = "Latest error message, if the thread failed")]
     pub error: Option<String>,
 }
 
@@ -58,7 +117,7 @@ impl ThreadRecord {
     }
 
     pub fn thread_uri(&self) -> String {
-        thread_uri(&self.thread_id)
+        thread_uri(&self.project_id, &self.thread_id)
     }
 
     pub fn push_event(&mut self, event: &ThreadEvent) {
@@ -67,7 +126,7 @@ impl ThreadRecord {
             ThreadEvent::ThreadStarted { thread_id } => {
                 self.thread_id.clone_from(thread_id);
                 self.process.push(ProcessStep {
-                    kind: "thread_started".into(),
+                    kind: ProcessStepKind::ThreadStarted,
                     summary: format!("Thread {thread_id} started"),
                     at: now,
                 });
@@ -75,28 +134,34 @@ impl ThreadRecord {
             ThreadEvent::TurnStarted => {
                 self.status = ThreadLifecycle::Running;
                 self.process.push(ProcessStep {
-                    kind: "turn_started".into(),
+                    kind: ProcessStepKind::TurnStarted,
                     summary: "Turn started".into(),
                     at: now,
                 });
             }
             ThreadEvent::ItemStarted { item } => {
                 self.process.push(ProcessStep {
-                    kind: format!("item_started:{}", item_kind(item)),
+                    kind: ProcessStepKind::ItemStarted {
+                        item: map_item_kind(item),
+                    },
                     summary: item_summary(item),
                     at: now,
                 });
             }
             ThreadEvent::ItemUpdated { item } => {
                 self.process.push(ProcessStep {
-                    kind: format!("item_updated:{}", item_kind(item)),
+                    kind: ProcessStepKind::ItemUpdated {
+                        item: map_item_kind(item),
+                    },
                     summary: item_summary(item),
                     at: now,
                 });
             }
             ThreadEvent::ItemCompleted { item } => {
                 self.process.push(ProcessStep {
-                    kind: format!("item_completed:{}", item_kind(item)),
+                    kind: ProcessStepKind::ItemCompleted {
+                        item: map_item_kind(item),
+                    },
                     summary: item_summary(item),
                     at: now,
                 });
@@ -104,7 +169,7 @@ impl ThreadRecord {
             ThreadEvent::TurnCompleted { .. } => {
                 self.status = ThreadLifecycle::Completed;
                 self.process.push(ProcessStep {
-                    kind: "turn_completed".into(),
+                    kind: ProcessStepKind::TurnCompleted,
                     summary: "Turn completed".into(),
                     at: now,
                 });
@@ -113,7 +178,7 @@ impl ThreadRecord {
                 self.status = ThreadLifecycle::Failed;
                 self.error = Some(error.message.clone());
                 self.process.push(ProcessStep {
-                    kind: "turn_failed".into(),
+                    kind: ProcessStepKind::TurnFailed,
                     summary: error.message.clone(),
                     at: now,
                 });
@@ -122,7 +187,7 @@ impl ThreadRecord {
                 self.status = ThreadLifecycle::Failed;
                 self.error = Some(message.clone());
                 self.process.push(ProcessStep {
-                    kind: "error".into(),
+                    kind: ProcessStepKind::Error,
                     summary: message.clone(),
                     at: now,
                 });
@@ -211,8 +276,29 @@ impl AppState {
         self.inner.read().await.projects.get(project_id).cloned()
     }
 
-    pub async fn list_threads(&self) -> Vec<ThreadRecord> {
-        self.inner.read().await.threads.values().cloned().collect()
+    pub async fn remove_thread(&self, thread_id: &str) -> Option<ThreadRecord> {
+        let mut inner = self.inner.write().await;
+        let record = inner.threads.remove(thread_id)?;
+        if let Some(project) = inner.projects.get_mut(&record.project_id) {
+            project.thread_ids.retain(|id| id != thread_id);
+            if project.thread_ids.is_empty() {
+                inner.projects.remove(&record.project_id);
+            }
+        }
+        Some(record)
+    }
+
+    pub async fn list_threads_for_project(&self, project_id: &str) -> Vec<ThreadRecord> {
+        let inner = self.inner.read().await;
+        let Some(project) = inner.projects.get(project_id) else {
+            return Vec::new();
+        };
+
+        project
+            .thread_ids
+            .iter()
+            .filter_map(|thread_id| inner.threads.get(thread_id).cloned())
+            .collect()
     }
 }
 
@@ -223,18 +309,18 @@ fn chrono_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn item_kind(item: &ThreadItem) -> &'static str {
+fn map_item_kind(item: &ThreadItem) -> ThreadItemKind {
     match item {
-        ThreadItem::AgentMessage(_) => "agent_message",
-        ThreadItem::UserMessage(_) => "user_message",
-        ThreadItem::CommandExecution(_) => "command_execution",
-        ThreadItem::FileChange(_) => "file_change",
-        ThreadItem::McpToolCall(_) => "mcp_tool_call",
-        ThreadItem::Reasoning(_) => "reasoning",
-        ThreadItem::Plan(_) => "plan",
-        ThreadItem::WebSearch(_) => "web_search",
-        ThreadItem::Error(_) => "error",
-        _ => "other",
+        ThreadItem::AgentMessage(_) => ThreadItemKind::AgentMessage,
+        ThreadItem::UserMessage(_) => ThreadItemKind::UserMessage,
+        ThreadItem::CommandExecution(_) => ThreadItemKind::CommandExecution,
+        ThreadItem::FileChange(_) => ThreadItemKind::FileChange,
+        ThreadItem::McpToolCall(_) => ThreadItemKind::McpToolCall,
+        ThreadItem::Reasoning(_) => ThreadItemKind::Reasoning,
+        ThreadItem::Plan(_) => ThreadItemKind::Plan,
+        ThreadItem::WebSearch(_) => ThreadItemKind::WebSearch,
+        ThreadItem::Error(_) => ThreadItemKind::Error,
+        _ => ThreadItemKind::Other,
     }
 }
 

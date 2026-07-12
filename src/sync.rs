@@ -1,7 +1,10 @@
 use codex_app_server_sdk::{
     api::Codex,
     error::ClientError,
-    protocol::{requests::ThreadListParams, requests::ThreadReadParams, responses::ThreadSummary},
+    protocol::{
+        requests::{ThreadArchiveParams, ThreadListParams, ThreadReadParams},
+        responses::ThreadSummary,
+    },
 };
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -12,6 +15,29 @@ const THREAD_LIST_PAGE_LIMIT: u32 = 100;
 const MAX_THREAD_LIST_PAGES: usize = 100;
 
 pub async fn sync_threads_from_codex(codex: &Codex, state: &AppState) -> Result<usize, ClientError> {
+    sync_threads_with_filter(codex, state, |_| true).await
+}
+
+pub async fn sync_threads_for_project(
+    codex: &Codex,
+    state: &AppState,
+    cwd: &str,
+) -> Result<usize, ClientError> {
+    let cwd = cwd.to_string();
+    sync_threads_with_filter(codex, state, move |summary| {
+        summary_string(summary, &["cwd"]).as_deref() == Some(cwd.as_str())
+    })
+    .await
+}
+
+async fn sync_threads_with_filter<F>(
+    codex: &Codex,
+    state: &AppState,
+    mut matches: F,
+) -> Result<usize, ClientError>
+where
+    F: FnMut(&ThreadSummary) -> bool,
+{
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
     let mut imported = 0usize;
@@ -27,11 +53,15 @@ pub async fn sync_threads_from_codex(codex: &Codex, state: &AppState) -> Result<
             .thread_list(ThreadListParams {
                 limit: Some(THREAD_LIST_PAGE_LIMIT),
                 cursor: cursor.clone(),
+                archived: Some(false),
                 ..Default::default()
             })
             .await?;
 
         for summary in page.data {
+            if !matches(&summary) || is_archived_summary(&summary) {
+                continue;
+            }
             let record = thread_record_from_summary(&summary);
             state.import_thread_if_absent(record).await;
             imported += 1;
@@ -45,6 +75,16 @@ pub async fn sync_threads_from_codex(codex: &Codex, state: &AppState) -> Result<
 
     info!(imported, "synced codex threads into mcp resources");
     Ok(imported)
+}
+
+pub async fn archive_remote_thread(codex: &Codex, thread_id: &str) -> Result<(), ClientError> {
+    codex
+        .thread_archive(ThreadArchiveParams {
+            thread_id: thread_id.to_string(),
+            extra: Default::default(),
+        })
+        .await?;
+    Ok(())
 }
 
 pub async fn ensure_thread_known(codex: &Codex, state: &AppState, thread_id: &str) -> Result<(), ClientError> {
@@ -67,6 +107,11 @@ pub async fn ensure_thread_known(codex: &Codex, state: &AppState, thread_id: &st
     };
 
     let record = thread_record_from_remote(thread_id, thread_value);
+    if is_archived_value(thread_value) {
+        return Err(ClientError::TransportSend(format!(
+            "thread `{thread_id}` is archived"
+        )));
+    }
     state.upsert_thread(record).await;
     Ok(())
 }
@@ -109,6 +154,14 @@ fn thread_record_from_remote(thread_id: &str, thread: &Value) -> ThreadRecord {
     let mut record = ThreadRecord::new(thread_id.to_string(), cwd, description);
     record.status = map_json_status(thread.get("status"));
     record
+}
+
+fn is_archived_summary(summary: &ThreadSummary) -> bool {
+    summary.archived == Some(true)
+}
+
+fn is_archived_value(thread: &Value) -> bool {
+    thread.get("archived").and_then(Value::as_bool) == Some(true)
 }
 
 fn map_remote_status(summary: &ThreadSummary) -> ThreadLifecycle {

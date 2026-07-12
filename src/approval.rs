@@ -15,11 +15,12 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::state::{AppState, ThreadLifecycle};
+use crate::state::{AppState, ApprovalKind, ProcessStepKind, ThreadLifecycle};
 
 type McpPeer = rmcp::service::Peer<RoleServer>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
     Approve,
     ApproveForSession,
@@ -111,12 +112,12 @@ async fn handle_command_execution_approval(
 ) -> Result<CommandExecutionRequestApprovalResponse, ClientError> {
     notify_approval_request(
         &peer,
-        "command_execution",
+        ApprovalKind::CommandExecution,
         &params.extra,
         policy,
     )
     .await;
-    track_approval(&state, &params.extra, "command_execution").await;
+    track_approval(&state, &params.extra, ApprovalKind::CommandExecution).await;
 
     let decision = match policy {
         ApprovalPolicy::Approve => json!("accept"),
@@ -135,8 +136,8 @@ async fn handle_exec_command_approval(
     policy: ApprovalPolicy,
     params: ExecCommandApprovalParams,
 ) -> Result<ExecCommandApprovalResponse, ClientError> {
-    notify_approval_request(&peer, "exec_command", &params.extra, policy).await;
-    track_approval(&state, &params.extra, "exec_command").await;
+    notify_approval_request(&peer, ApprovalKind::ExecCommand, &params.extra, policy).await;
+    track_approval(&state, &params.extra, ApprovalKind::ExecCommand).await;
 
     let decision = match policy {
         ApprovalPolicy::Approve => json!("approved"),
@@ -155,8 +156,8 @@ async fn handle_apply_patch_approval(
     policy: ApprovalPolicy,
     params: ApplyPatchApprovalParams,
 ) -> Result<ApplyPatchApprovalResponse, ClientError> {
-    notify_approval_request(&peer, "apply_patch", &params.extra, policy).await;
-    track_approval(&state, &params.extra, "apply_patch").await;
+    notify_approval_request(&peer, ApprovalKind::ApplyPatch, &params.extra, policy).await;
+    track_approval(&state, &params.extra, ApprovalKind::ApplyPatch).await;
 
     let decision = match policy {
         ApprovalPolicy::Approve => json!("approved"),
@@ -175,8 +176,8 @@ async fn handle_file_change_approval(
     policy: ApprovalPolicy,
     params: FileChangeRequestApprovalParams,
 ) -> Result<FileChangeRequestApprovalResponse, ClientError> {
-    notify_approval_request(&peer, "file_change", &params.extra, policy).await;
-    track_approval(&state, &params.extra, "file_change").await;
+    notify_approval_request(&peer, ApprovalKind::FileChange, &params.extra, policy).await;
+    track_approval(&state, &params.extra, ApprovalKind::FileChange).await;
 
     let decision = match policy {
         ApprovalPolicy::Approve => json!("accept"),
@@ -191,7 +192,7 @@ async fn handle_file_change_approval(
 
 async fn notify_approval_request(
     peer: &Arc<RwLock<Option<McpPeer>>>,
-    kind: &str,
+    kind: ApprovalKind,
     params: &serde_json::Map<String, Value>,
     policy: ApprovalPolicy,
 ) {
@@ -201,7 +202,7 @@ async fn notify_approval_request(
 
     let payload = json!({
         "kind": kind,
-        "policy": format!("{policy:?}"),
+        "policy": policy,
         "params": params,
     });
 
@@ -214,14 +215,14 @@ async fn notify_approval_request(
         ))
         .await
     {
-        warn!(?error, kind, "failed to send approval notification");
+        warn!(?error, ?kind, "failed to send approval notification");
     }
 }
 
 async fn track_approval(
     state: &AppState,
     params: &serde_json::Map<String, Value>,
-    kind: &str,
+    kind: ApprovalKind,
 ) {
     let Some(thread_id) = params
         .get("threadId")
@@ -236,13 +237,13 @@ async fn track_approval(
         .or_else(|| params.get("reason"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| kind.to_string());
+        .unwrap_or_else(|| serde_json::to_string(&kind).unwrap_or_default());
 
     state
         .update_thread(&thread_id, |record| {
             record.status = ThreadLifecycle::WaitingApproval;
             record.process.push(crate::state::ProcessStep {
-                kind: format!("approval:{kind}"),
+                kind: ProcessStepKind::Approval { kind },
                 summary,
                 at: 0,
             });

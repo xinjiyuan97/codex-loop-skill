@@ -2,7 +2,7 @@
 name = "codex-mcp-server"
 version = "0.1.0"
 edition = "2021"
-description = "MCP server wrapping Codex app-server with project/thread resources and lifecycle tools"
+description = "MCP server for Codex Loop Skill — wraps Codex app-server with project/thread resources and lifecycle tools"
 license = "MIT"
 
 [dependencies]

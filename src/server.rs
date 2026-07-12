@@ -15,9 +15,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     approval::{self, ApprovalPolicy},
-    resources::{decode_project_id, parse_resource_uri, project_uri, ResourceKind},
-    state::{AppState, ThreadLifecycle, ThreadRecord},
-    sync::{self, ensure_thread_known, merge_thread_resource, read_remote_thread},
+    resources::{decode_project_id, parse_resource_uri, project_uri, thread_uri, ResourceKind},
+    state::{AppState, ProcessStepKind, ThreadLifecycle, ThreadRecord},
+    sync::{self, archive_remote_thread, ensure_thread_known, merge_thread_resource, read_remote_thread},
 };
 
 type McpPeer = rmcp::service::Peer<RoleServer>;
@@ -30,55 +30,133 @@ pub struct CodexMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxModeParam {
+    /// Read-only filesystem access.
+    #[serde(alias = "read_only", alias = "readonly")]
+    #[schemars(description = "Read-only filesystem access")]
+    ReadOnly,
+    /// Allow writes within the workspace.
+    #[serde(alias = "workspace_write", alias = "workspacewrite")]
+    #[schemars(description = "Allow writes within the workspace")]
+    WorkspaceWrite,
+    /// Disable sandbox restrictions.
+    #[serde(alias = "danger_full_access", alias = "dangerfullaccess")]
+    #[schemars(description = "Disable sandbox restrictions")]
+    DangerFullAccess,
+}
+
+impl SandboxModeParam {
+    fn into_sdk(self) -> SandboxMode {
+        match self {
+            Self::ReadOnly => SandboxMode::ReadOnly,
+            Self::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+            Self::DangerFullAccess => SandboxMode::DangerFullAccess,
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(description = "Arguments for creating a new Codex thread.")]
 struct StartParams {
-    /// Full business description / initial user prompt for the new thread.
+    /// Brief summary for the calling agent to identify and track this thread.
+    #[schemars(description = "Brief task summary for the calling agent to judge scope and track the thread in resource listings")]
     description: String,
+    /// Full task requirement sent to Codex as the initial user message.
+    #[schemars(description = "Full task requirement in markdown (supports mermaid). Sent to Codex as the initial user prompt")]
+    prompt: String,
     /// Working directory (project root). Defaults to the server process cwd.
     #[serde(default)]
+    #[schemars(default)]
+    #[schemars(description = "Project working directory. Defaults to the MCP server process cwd")]
     cwd: Option<String>,
     /// When true, wait for the turn to finish before returning. When false, return thread id immediately and notify on completion.
     #[serde(default = "default_block")]
+    #[schemars(default = "default_block")]
+    #[schemars(description = "Wait for completion when true; return thread_id immediately and notify later when false")]
     block: bool,
     /// Optional Codex model override.
     #[serde(default)]
+    #[schemars(default)]
+    #[schemars(description = "Optional Codex model override")]
     model: Option<String>,
-    /// Sandbox mode: read-only, workspace-write, danger-full-access.
-    #[serde(default)]
-    sandbox: Option<String>,
+    /// Sandbox mode. Defaults to danger-full-access for unrestricted execution.
+    #[serde(default = "default_sandbox")]
+    #[schemars(default = "default_sandbox")]
+    #[schemars(description = "Sandbox mode for command execution and file changes. Defaults to danger-full-access.")]
+    sandbox: SandboxModeParam,
 }
 
 fn default_block() -> bool {
     true
 }
 
+fn default_sandbox() -> SandboxModeParam {
+    SandboxModeParam::DangerFullAccess
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(description = "Arguments for replying to an existing Codex thread.")]
 struct ReplyParams {
+    #[schemars(description = "Target thread id returned by start or listed under a project resource")]
     thread_id: String,
+    #[schemars(description = "Follow-up user prompt to send to the thread")]
     prompt: String,
     #[serde(default = "default_block")]
+    #[schemars(default = "default_block")]
+    #[schemars(description = "Wait for completion when true; return immediately and notify later when false")]
     block: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(description = "Arguments for inspecting a thread execution trace.")]
 struct ProcessParams {
+    #[schemars(description = "Target thread id to inspect")]
     thread_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[schemars(description = "Result of the start tool.")]
 struct StartResult {
+    #[schemars(description = "Created or resumed Codex thread id")]
     thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Final agent response when block=true")]
     content: Option<String>,
+    #[schemars(description = "Whether the call waited for turn completion")]
     blocked: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[schemars(description = "Result of the reply tool.")]
 struct ReplyResult {
+    #[schemars(description = "Target thread id")]
     thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Final agent response when block=true")]
     content: Option<String>,
+    #[schemars(description = "Whether the call waited for turn completion")]
     blocked: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(description = "Arguments for archiving a Codex thread.")]
+struct ArchiveParams {
+    #[schemars(description = "Target thread id to archive and remove from project listings")]
+    thread_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[schemars(description = "Result of the archive tool.")]
+struct ArchiveResult {
+    #[schemars(description = "Archived thread id")]
+    thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Project id the thread belonged to before archival")]
+    project_id: Option<String>,
+    #[schemars(description = "Whether the thread was archived successfully")]
+    archived: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,16 +206,13 @@ impl CodexMcpServer {
     fn build_thread_options(
         cwd: &str,
         model: Option<String>,
-        sandbox: Option<String>,
+        sandbox: SandboxModeParam,
     ) -> ThreadOptions {
-        let mut builder = ThreadOptions::builder().working_directory(cwd);
+        let mut builder = ThreadOptions::builder()
+            .working_directory(cwd)
+            .sandbox_mode(sandbox.into_sdk());
         if let Some(model) = model {
             builder = builder.model(model);
-        }
-        if let Some(mode) = sandbox {
-            if let Some(parsed) = parse_sandbox_mode(&mode) {
-                builder = builder.sandbox_mode(parsed);
-            }
         }
         builder.build()
     }
@@ -258,91 +333,116 @@ impl CodexMcpServer {
             .await;
     }
 
+    async fn notify_thread_archived(
+        &self,
+        peer: &McpPeer,
+        thread_id: &str,
+        project_id: Option<&str>,
+    ) {
+        let _ = peer.notify_resource_list_changed().await;
+        if let Some(project_id) = project_id {
+            let _ = peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                    project_uri(project_id),
+                ))
+                .await;
+        } else {
+            tracing::debug!(thread_id, "archived thread had no local project mapping");
+        }
+    }
+
     async fn start_thread_internal(
         &self,
         description: String,
+        prompt: String,
         cwd: String,
         model: Option<String>,
-        sandbox: Option<String>,
+        sandbox: SandboxModeParam,
     ) -> Result<(String, String), McpError> {
         let thread_options = Self::build_thread_options(&cwd, model, sandbox);
         let mut thread = self.codex.start_thread(thread_options);
+        let streamed = thread
+            .run_streamed(prompt, TurnOptions::default())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
         let thread_id = thread
             .id()
             .ok_or_else(|| McpError::internal_error("thread id missing after start", None))?
             .to_string();
 
-        let record = ThreadRecord::new(thread_id.clone(), cwd, description.clone());
+        let record = ThreadRecord::new(thread_id.clone(), cwd, description);
         self.state.upsert_thread(record).await;
 
-        let turn = thread
-            .run(description, TurnOptions::default())
+        let final_response = self
+            .track_streamed_turn(&thread_id, streamed)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(|error| McpError::internal_error(error, None))?;
 
-        let effective_id = thread.id().unwrap_or(&thread_id).to_string();
         self.state
-            .update_thread(&effective_id, |record| {
+            .update_thread(&thread_id, |record| {
                 record.status = ThreadLifecycle::Completed;
-                record.final_response = Some(turn.final_response.clone());
-                record.process.push(crate::state::ProcessStep {
-                    kind: "turn_completed".into(),
-                    summary: "Initial turn completed".into(),
-                    at: 0,
-                });
+                if !final_response.is_empty() {
+                    record.final_response = Some(final_response.clone());
+                }
             })
             .await;
 
-        Ok((effective_id, turn.final_response))
+        Ok((thread_id, final_response))
     }
 
     async fn start_thread_nonblocking(
         &self,
         description: String,
+        prompt: String,
         cwd: String,
         model: Option<String>,
-        sandbox: Option<String>,
+        sandbox: SandboxModeParam,
         peer: McpPeer,
     ) -> Result<String, McpError> {
         let thread_options = Self::build_thread_options(&cwd, model, sandbox);
         let mut thread = self.codex.start_thread(thread_options);
+        let streamed = thread
+            .run_streamed(prompt, TurnOptions::default())
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
         let thread_id = thread
             .id()
             .ok_or_else(|| McpError::internal_error("thread id missing after start", None))?
             .to_string();
 
-        let record = ThreadRecord::new(thread_id.clone(), cwd, description.clone());
+        let record = ThreadRecord::new(thread_id.clone(), cwd, description);
         self.state.upsert_thread(record).await;
 
         let server = self.clone();
         let thread_id_for_task = thread_id.clone();
         tokio::spawn(async move {
-            let result = async {
-                let streamed = thread
-                    .run_streamed(description, TurnOptions::default())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                server
-                    .track_streamed_turn(&thread_id_for_task, streamed)
-                    .await
-            }
-            .await;
+            let result = server
+                .track_streamed_turn(&thread_id_for_task, streamed)
+                .await;
 
-            if let Err(message) = result {
-                server
-                    .state
-                    .update_thread(&thread_id_for_task, |record| {
-                        record.status = ThreadLifecycle::Failed;
-                        record.error = Some(message);
-                    })
-                    .await;
-            } else {
-                server
-                    .state
-                    .update_thread(&thread_id_for_task, |record| {
-                        record.status = ThreadLifecycle::Completed;
-                    })
-                    .await;
+            match result {
+                Err(message) => {
+                    server
+                        .state
+                        .update_thread(&thread_id_for_task, |record| {
+                            record.status = ThreadLifecycle::Failed;
+                            record.error = Some(message);
+                        })
+                        .await;
+                }
+                Ok(response) => {
+                    server
+                        .state
+                        .update_thread(&thread_id_for_task, |record| {
+                            record.status = ThreadLifecycle::Completed;
+                            if !response.is_empty() {
+                                record.final_response = Some(response);
+                            }
+                        })
+                        .await;
+                }
             }
 
             server
@@ -356,7 +456,13 @@ impl CodexMcpServer {
 
 #[tool_router]
 impl CodexMcpServer {
-    #[tool(description = "Create a new Codex thread with a full business description. Supports blocking and non-blocking modes.")]
+    #[tool(
+        title = "Start Thread",
+        description = "Create a new Codex thread in a project working directory. \
+            Provide a brief description for tracking and a full prompt for Codex to execute. \
+            Use block=true to wait for the agent response, or block=false to return thread_id immediately and receive a completion notification later.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<StartResult>()
+    )]
     async fn start(
         &self,
         Parameters(params): Parameters<StartParams>,
@@ -369,6 +475,7 @@ impl CodexMcpServer {
             let (thread_id, content) = self
                 .start_thread_internal(
                     params.description,
+                    params.prompt,
                     cwd,
                     params.model,
                     params.sandbox,
@@ -386,6 +493,7 @@ impl CodexMcpServer {
         let thread_id = self
             .start_thread_nonblocking(
                 params.description,
+                params.prompt,
                 cwd,
                 params.model,
                 params.sandbox,
@@ -400,7 +508,13 @@ impl CodexMcpServer {
         tool_json_result(&payload)
     }
 
-    #[tool(description = "Reply to an existing Codex thread.")]
+    #[tool(
+        title = "Reply Thread",
+        description = "Send a follow-up prompt to an existing Codex thread. \
+            Requires thread_id from start or from project:// resource listing. \
+            Use block=true to wait for the response, or block=false for async completion notification.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ReplyResult>()
+    )]
     async fn reply(
         &self,
         Parameters(params): Parameters<ReplyParams>,
@@ -414,7 +528,7 @@ impl CodexMcpServer {
             .update_thread(&params.thread_id, |record| {
                 record.status = ThreadLifecycle::Running;
                 record.process.push(crate::state::ProcessStep {
-                    kind: "user_reply".into(),
+                    kind: ProcessStepKind::UserReply,
                     summary: truncate(&params.prompt, 120),
                     at: 0,
                 });
@@ -450,7 +564,11 @@ impl CodexMcpServer {
         tool_json_result(&payload)
     }
 
-    #[tool(description = "Inspect the current execution flow for a thread.")]
+    #[tool(
+        title = "Process Trace",
+        description = "Inspect the local execution trace for a thread, including lifecycle status, process steps, final response, and errors.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ThreadRecord>()
+    )]
     async fn process(
         &self,
         Parameters(params): Parameters<ProcessParams>,
@@ -473,12 +591,42 @@ impl CodexMcpServer {
         };
         tool_json_result(&record)
     }
+
+    #[tool(
+        title = "Archive Thread",
+        description = "Archive a Codex thread and remove it from local project listings. \
+            The archived thread will no longer appear when reading project:// resources.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ArchiveResult>()
+    )]
+    async fn archive(
+        &self,
+        Parameters(params): Parameters<ArchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        archive_remote_thread(&self.codex, &params.thread_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        let removed = self.state.remove_thread(&params.thread_id).await;
+        let project_id = removed.map(|record| record.project_id);
+
+        if let Some(peer) = self.peer.read().await.clone() {
+            self.notify_thread_archived(&peer, &params.thread_id, project_id.as_deref())
+                .await;
+        }
+
+        let payload = ArchiveResult {
+            thread_id: params.thread_id,
+            project_id,
+            archived: true,
+        };
+        tool_json_result(&payload)
+    }
 }
 
 #[tool_handler(
     name = "codex-mcp-server",
     version = "0.1.0",
-    instructions = "Codex MCP server exposing project/thread resources and start/reply/process tools backed by codex app-server."
+    instructions = "Codex MCP server exposing project/thread resources and start/reply/process/archive tools backed by codex app-server."
 )]
 impl ServerHandler for CodexMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -493,8 +641,10 @@ impl ServerHandler for CodexMcpServer {
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(
-            "Use resources codex://project/{id} and codex://thread/{id}. Thread resources merge local execution state with codex thread/read payloads. \
-             Tools: start, reply, process. Non-blocking start/reply emits notifications/codex/thread/completed. \
+            "Use resources/list for projects only; read project://{project_id} to list thread ids for that project. \
+             Individual threads use thread://{project_id}/{thread_id}. Thread resources merge local execution state with codex thread/read payloads. \
+             Tools: start, reply, process, archive. Use archive to close a thread and remove it from project listings. \
+             Non-blocking start/reply emits notifications/codex/thread/completed. \
              Approval requests emit notifications/codex/approval/request; policy via CODEX_MCP_APPROVAL_POLICY=approve|session|deny.",
         )
     }
@@ -510,11 +660,6 @@ impl ServerHandler for CodexMcpServer {
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         *self.peer.write().await = Some(context.peer.clone());
-
-        if let Err(error) = sync::sync_threads_from_codex(&self.codex, &self.state).await {
-            tracing::warn!(?error, "failed to refresh threads after mcp initialize");
-            return;
-        }
 
         let _ = context
             .peer
@@ -534,12 +679,6 @@ impl ServerHandler for CodexMcpServer {
                     .with_description("Codex project (grouped by working directory)"),
             );
         }
-        for thread in self.state.list_threads().await {
-            resources.push(
-                Resource::new(thread.thread_uri(), thread.description.clone())
-                    .with_description(format!("Codex thread ({:?})", thread.status)),
-            );
-        }
 
         Ok(ListResourcesResult {
             resources,
@@ -555,11 +694,14 @@ impl ServerHandler for CodexMcpServer {
         Ok(ListResourceTemplatesResult {
             resource_templates: vec![
                 ResourceTemplate::new(
-                    "codex://project/{project_id}",
+                    "project://{project_id}",
                     "Codex project by encoded cwd",
                 )
-                .with_description("Project id is URL-safe base64 of the absolute cwd"),
-                ResourceTemplate::new("codex://thread/{thread_id}", "Codex thread by id"),
+                .with_description("Project id is a short stable hash of the absolute cwd"),
+                ResourceTemplate::new(
+                    "thread://{project_id}/{thread_id}",
+                    "Codex thread by project and id",
+                ),
             ],
             ..Default::default()
         })
@@ -572,30 +714,47 @@ impl ServerHandler for CodexMcpServer {
     ) -> Result<ReadResourceResult, McpError> {
         let body = match parse_resource_uri(&request.uri) {
             ResourceKind::Project(project_id) => {
-                let project = self.state.get_project(&project_id).await;
-                let threads = if let Some(project) = &project {
-                    let mut items = Vec::new();
-                    for thread_id in &project.thread_ids {
-                        if let Some(thread) = self.state.get_thread(thread_id).await {
-                            items.push(json!({
-                                "thread_id": thread.thread_id,
-                                "status": thread.status,
-                                "description": thread.description,
-                            }));
-                        }
+                let cwd = self
+                    .state
+                    .get_project(&project_id)
+                    .await
+                    .map(|project| project.cwd)
+                    .or_else(|| decode_project_id(&project_id));
+
+                if let Some(cwd) = cwd.as_deref() {
+                    if let Err(error) =
+                        sync::sync_threads_for_project(&self.codex, &self.state, cwd).await
+                    {
+                        tracing::warn!(
+                            ?error,
+                            project_id = %project_id,
+                            "failed to sync threads for project"
+                        );
                     }
-                    items
-                } else {
-                    Vec::new()
-                };
+                }
+
+                let threads = self
+                    .state
+                    .list_threads_for_project(&project_id)
+                    .await
+                    .into_iter()
+                    .map(|thread| {
+                        json!({
+                            "thread_id": thread.thread_id,
+                            "thread_uri": thread_uri(&thread.project_id, &thread.thread_id),
+                            "status": thread.status,
+                            "description": thread.description,
+                        })
+                    })
+                    .collect::<Vec<_>>();
 
                 json!({
                     "project_id": project_id,
-                    "cwd": project.as_ref().map(|p| p.cwd.clone()).or_else(|| decode_project_id(&project_id)),
+                    "cwd": cwd,
                     "threads": threads,
                 })
             }
-            ResourceKind::Thread(thread_id) => {
+            ResourceKind::Thread { thread_id, .. } => {
                 let local = self.state.get_thread(&thread_id).await;
                 let remote = read_remote_thread(&self.codex, &thread_id, true)
                     .await
@@ -629,23 +788,10 @@ impl ServerHandler for CodexMcpServer {
     }
 }
 
-fn parse_sandbox_mode(value: &str) -> Option<SandboxMode> {
-    match value.to_ascii_lowercase().as_str() {
-        "read-only" | "read_only" | "readonly" => Some(SandboxMode::ReadOnly),
-        "workspace-write" | "workspace_write" | "workspacewrite" => {
-            Some(SandboxMode::WorkspaceWrite)
-        }
-        "danger-full-access" | "danger_full_access" | "dangerfullaccess" => {
-            Some(SandboxMode::DangerFullAccess)
-        }
-        _ => None,
-    }
-}
-
 fn tool_json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(value)
+    let value = serde_json::to_value(value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    Ok(CallToolResult::structured(value))
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -653,5 +799,70 @@ fn truncate(value: &str, max: usize) -> String {
         value.to_string()
     } else {
         format!("{}…", value.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tool_schema_tests {
+    use super::*;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    fn assert_input_schema<T: schemars::JsonSchema + 'static>(label: &str) {
+        let schema = rmcp::handler::server::common::schema_for_input::<T>()
+            .unwrap_or_else(|error| panic!("{label} input schema invalid: {error}"));
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object"),
+            "{label} inputSchema root type must be object: {schema:?}"
+        );
+    }
+
+    #[test]
+    fn list_tools_result_uses_input_schema_camel_case() {
+        let tools = CodexMcpServer::tool_router().list_all();
+        let result = rmcp::model::ListToolsResult::with_all_items(tools);
+        let json = serde_json::to_value(rmcp::model::ServerResult::ListToolsResult(result))
+            .expect("serialize list tools result");
+        let tools_json = json
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .expect("tools array");
+        for tool in tools_json {
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "list_tools result missing inputSchema: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_attr_functions_expose_input_schema() {
+        assert_input_schema::<Parameters<StartParams>>("start");
+        assert_input_schema::<Parameters<ReplyParams>>("reply");
+        assert_input_schema::<Parameters<ProcessParams>>("process");
+        assert_input_schema::<Parameters<ArchiveParams>>("archive");
+
+        let tools = [
+            CodexMcpServer::start_tool_attr(),
+            CodexMcpServer::reply_tool_attr(),
+            CodexMcpServer::process_tool_attr(),
+            CodexMcpServer::archive_tool_attr(),
+        ];
+
+        for tool in tools {
+            let json = serde_json::to_value(&tool).expect("serialize tool");
+            assert!(
+                json.get("inputSchema").is_some(),
+                "tool {} missing inputSchema: {json}",
+                tool.name
+            );
+            let input_schema = json.get("inputSchema").unwrap();
+            assert_eq!(
+                input_schema.get("type").and_then(|value| value.as_str()),
+                Some("object"),
+                "tool {} inputSchema must be object: {input_schema}",
+                tool.name
+            );
+        }
     }
 }

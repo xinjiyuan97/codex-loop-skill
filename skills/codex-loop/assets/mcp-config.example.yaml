@@ -1,0 +1,11 @@
+# Merge into ~/.hermes/config.yaml under mcp_servers:
+mcp_servers:
+  codex:
+    command: "/absolute/path/to/codex-loop/assets/bin/codex-mcp-server"
+    args: []
+    env:
+      CODEX_MCP_APPROVAL_POLICY: "approve"
+    tools:
+      include: [start, reply, process, archive]
+      resources: true
+      prompts: false
