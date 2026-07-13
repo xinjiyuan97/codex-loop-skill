@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use crate::{
     approval::{self, ApprovalPolicy},
     resources::{decode_project_id, parse_resource_uri, project_uri, thread_uri, ResourceKind},
-    state::{AppState, ProcessStepKind, ThreadLifecycle, ThreadRecord},
+    state::{AppState, ProcessResult, ProcessStepKind, ThreadLifecycle, ThreadRecord},
     sync::{self, archive_remote_thread, ensure_thread_known, merge_thread_resource, read_remote_thread},
 };
 
@@ -109,11 +109,20 @@ struct ReplyParams {
     block: bool,
 }
 
+fn default_process_rounds() -> u32 {
+    3
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[schemars(description = "Arguments for inspecting a thread execution trace.")]
 struct ProcessParams {
     #[schemars(description = "Target thread id to inspect")]
     thread_id: String,
+    /// Number of recent rounds to include while the thread is still in progress.
+    #[serde(default = "default_process_rounds")]
+    #[schemars(default = "default_process_rounds")]
+    #[schemars(description = "Number of recent rounds to return when status is in progress (starting/running/waiting_approval). Ignored when completed, failed, or interrupted; those always return the last round only.")]
+    round: u32,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -566,8 +575,9 @@ impl CodexMcpServer {
 
     #[tool(
         title = "Process Trace",
-        description = "Inspect the local execution trace for a thread, including lifecycle status, process steps, final response, and errors.",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ThreadRecord>()
+        description = "Inspect the local execution trace for a thread, including lifecycle status, process steps, final response, and errors. \
+            Completed threads return only the last round; in-progress threads return the most recent rounds (default 3, configurable via round).",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ProcessResult>()
     )]
     async fn process(
         &self,
@@ -589,7 +599,8 @@ impl CodexMcpServer {
                     )
                 })?
         };
-        tool_json_result(&record)
+        let result = record.into_process_result(params.round);
+        tool_json_result(&result)
     }
 
     #[tool(

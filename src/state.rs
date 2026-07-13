@@ -97,7 +97,107 @@ pub struct ThreadRecord {
     pub error: Option<String>,
 }
 
+/// Splits the execution trace into rounds. Each round begins at
+/// [`ProcessStepKind::ThreadStarted`] or [`ProcessStepKind::UserReply`].
+pub fn split_process_into_rounds(process: &[ProcessStep]) -> Vec<Vec<ProcessStep>> {
+    let mut rounds: Vec<Vec<ProcessStep>> = Vec::new();
+    let mut current: Vec<ProcessStep> = Vec::new();
+
+    for step in process {
+        let starts_round = matches!(
+            step.kind,
+            ProcessStepKind::ThreadStarted | ProcessStepKind::UserReply
+        );
+        if starts_round && !current.is_empty() {
+            rounds.push(current);
+            current = Vec::new();
+        }
+        current.push(step.clone());
+    }
+
+    if !current.is_empty() {
+        rounds.push(current);
+    }
+
+    rounds
+}
+
+/// Filters process steps based on thread status and a round limit.
+///
+/// Completed/failed/interrupted threads return only the last round.
+/// In-progress threads return the most recent `round_limit` rounds (default 3).
+pub fn filter_process_for_response(
+    process: &[ProcessStep],
+    status: ThreadLifecycle,
+    round_limit: u32,
+) -> (Vec<ProcessStep>, usize, usize) {
+    let rounds = split_process_into_rounds(process);
+    let total_rounds = rounds.len();
+    if total_rounds == 0 {
+        return (Vec::new(), 0, 0);
+    }
+
+    let take = match status {
+        ThreadLifecycle::Completed | ThreadLifecycle::Failed | ThreadLifecycle::Interrupted => 1,
+        ThreadLifecycle::Starting | ThreadLifecycle::Running | ThreadLifecycle::WaitingApproval => {
+            round_limit.max(1) as usize
+        }
+    };
+
+    let start = total_rounds.saturating_sub(take);
+    let selected: Vec<ProcessStep> = rounds[start..]
+        .iter()
+        .flat_map(|round| round.iter().cloned())
+        .collect();
+    let rounds_included = total_rounds - start;
+
+    (selected, total_rounds, rounds_included)
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(description = "Filtered thread execution trace returned by the process tool.")]
+pub struct ProcessResult {
+    #[schemars(description = "Codex thread id")]
+    pub thread_id: String,
+    #[schemars(description = "Short stable project id derived from cwd")]
+    pub project_id: String,
+    #[schemars(description = "Absolute working directory for the thread")]
+    pub cwd: String,
+    #[schemars(description = "Brief task summary for calling-agent tracking and project resource listings")]
+    pub description: String,
+    #[schemars(description = "Current local lifecycle status")]
+    pub status: ThreadLifecycle,
+    #[schemars(description = "Filtered local execution trace for the selected rounds")]
+    pub process: Vec<ProcessStep>,
+    #[schemars(description = "Latest final agent response, if available")]
+    pub final_response: Option<String>,
+    #[schemars(description = "Latest error message, if the thread failed")]
+    pub error: Option<String>,
+    #[schemars(description = "Total number of execution rounds recorded")]
+    pub total_rounds: usize,
+    #[schemars(description = "Number of rounds included in this response")]
+    pub rounds_included: usize,
+}
+
 impl ThreadRecord {
+    pub fn into_process_result(self, round_limit: u32) -> ProcessResult {
+        let (process, total_rounds, rounds_included) =
+            filter_process_for_response(&self.process, self.status, round_limit);
+
+        ProcessResult {
+            thread_id: self.thread_id,
+            project_id: self.project_id,
+            cwd: self.cwd,
+            description: self.description,
+            status: self.status,
+            process,
+            final_response: self.final_response,
+            error: self.error,
+            total_rounds,
+            rounds_included,
+        }
+    }
+
     pub fn new(thread_id: String, cwd: String, description: String) -> Self {
         let project_id = encode_project_id(&cwd);
         Self {
@@ -364,4 +464,93 @@ fn truncate(value: &str, max: usize) -> String {
 #[allow(dead_code)]
 fn format_thread_error(error: &ThreadError) -> String {
     error.message.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(kind: ProcessStepKind, summary: &str) -> ProcessStep {
+        ProcessStep {
+            kind,
+            summary: summary.to_string(),
+            at: 0,
+        }
+    }
+
+    fn sample_process() -> Vec<ProcessStep> {
+        vec![
+            step(ProcessStepKind::ThreadStarted, "thread"),
+            step(ProcessStepKind::TurnStarted, "turn 1"),
+            step(ProcessStepKind::TurnCompleted, "done 1"),
+            step(ProcessStepKind::UserReply, "reply 2"),
+            step(ProcessStepKind::TurnStarted, "turn 2"),
+            step(ProcessStepKind::TurnCompleted, "done 2"),
+            step(ProcessStepKind::UserReply, "reply 3"),
+            step(ProcessStepKind::TurnStarted, "turn 3"),
+            step(ProcessStepKind::ItemCompleted {
+                item: ThreadItemKind::AgentMessage,
+            }, "msg 3"),
+        ]
+    }
+
+    #[test]
+    fn split_process_into_rounds_groups_by_thread_start_and_user_reply() {
+        let rounds = split_process_into_rounds(&sample_process());
+        assert_eq!(rounds.len(), 3);
+        assert!(matches!(
+            rounds[0].first().map(|step| &step.kind),
+            Some(ProcessStepKind::ThreadStarted)
+        ));
+        assert!(matches!(
+            rounds[1].first().map(|step| &step.kind),
+            Some(ProcessStepKind::UserReply)
+        ));
+        assert!(matches!(
+            rounds[2].first().map(|step| &step.kind),
+            Some(ProcessStepKind::UserReply)
+        ));
+    }
+
+    #[test]
+    fn completed_status_returns_only_last_round() {
+        let process = sample_process();
+        let (filtered, total_rounds, rounds_included) =
+            filter_process_for_response(&process, ThreadLifecycle::Completed, 3);
+
+        assert_eq!(total_rounds, 3);
+        assert_eq!(rounds_included, 1);
+        assert_eq!(filtered.len(), 3);
+        assert!(matches!(
+            filtered.first().map(|step| &step.kind),
+            Some(ProcessStepKind::UserReply)
+        ));
+    }
+
+    #[test]
+    fn running_status_returns_recent_rounds_with_default_limit() {
+        let process = sample_process();
+        let (filtered, total_rounds, rounds_included) =
+            filter_process_for_response(&process, ThreadLifecycle::Running, 3);
+
+        assert_eq!(total_rounds, 3);
+        assert_eq!(rounds_included, 3);
+        assert_eq!(filtered.len(), process.len());
+    }
+
+    #[test]
+    fn running_status_respects_custom_round_limit() {
+        let process = sample_process();
+        let (filtered, total_rounds, rounds_included) =
+            filter_process_for_response(&process, ThreadLifecycle::Running, 2);
+
+        assert_eq!(total_rounds, 3);
+        assert_eq!(rounds_included, 2);
+        assert_eq!(filtered.len(), 6);
+        assert!(matches!(
+            filtered.first().map(|step| &step.kind),
+            Some(ProcessStepKind::UserReply)
+        ));
+        assert_eq!(filtered[0].summary, "reply 2");
+    }
 }
