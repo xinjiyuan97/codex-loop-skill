@@ -79,7 +79,7 @@ mcp_servers:
     env:
       CODEX_MCP_APPROVAL_POLICY: "approve"
     tools:
-      include: [start, reply, process, archive]
+      include: [start, reply, cancel, process, archive]
       resources: true
       prompts: false
 ```
@@ -91,7 +91,7 @@ mcp_servers:
 - [ ] `hermes mcp list` 含 `codex` 且 enabled
 - [ ] `hermes mcp test codex` 成功
 - [ ] 用户已 `/reload-mcp`
-- [ ] Agent 工具列表含：`mcp_codex_start`, `mcp_codex_reply`, `mcp_codex_process`, `mcp_codex_archive`
+- [ ] Agent 工具列表含：`mcp_codex_start`, `mcp_codex_reply`, `mcp_codex_cancel`, `mcp_codex_process`, `mcp_codex_archive`
 - [ ] `codex` CLI 可用
 
 ```bash
@@ -106,6 +106,7 @@ mcp_servers:
 |-------------|------|
 | `mcp_codex_start` | 新建 thread（`description` + `prompt`） |
 | `mcp_codex_reply` | 同 thread 修正 |
+| `mcp_codex_cancel` | 中断跑偏的 thread，及时止损 |
 | `mcp_codex_process` | 轮询进度 |
 | `mcp_codex_archive` | 归档 |
 
@@ -149,7 +150,7 @@ mcp_servers:
 
 ```
 Verify MCP → Classify task → Create branch → (Split modules) → mcp_codex_start
-→ Validate → mcp_codex_reply (same thread) → mcp_codex_archive
+→ Validate → mcp_codex_reply (same thread) → (mcp_codex_cancel if runaway) → mcp_codex_archive
 ```
 
 ---
@@ -517,9 +518,10 @@ Scan all threads' `status` in one call — ideal for multi-thread orchestration 
 1. mcp_codex_start/reply with block=false  →  get thread_id
 2. loop:
      a. mcp_codex_process(thread_id)  →  check status
-     b. if running/starting/waiting_approval  →  wait, retry
-     c. if completed  →  validate, proceed
-     d. if failed  →  mcp_codex_reply with fix or escalate
+     b. if running/starting/waiting_approval  →  inspect trace, wait, retry
+     c. if clearly off-track  →  mcp_codex_cancel, then mcp_codex_reply with correction
+     d. if completed  →  validate, proceed
+     e. if failed  →  mcp_codex_reply with fix or escalate
 3. mcp_codex_archive(thread_id) when done
 ```
 
@@ -527,11 +529,11 @@ Scan all threads' `status` in one call — ideal for multi-thread orchestration 
 
 | Status | Action |
 |--------|--------|
-| `starting` / `running` | Wait, continue polling |
+| `starting` / `running` | Wait, continue polling. If clearly off-track → `mcp_codex_cancel` |
 | `waiting_approval` | Check approval policy; may need user intervention |
 | `completed` | Validate output, then `mcp_codex_archive` or `mcp_codex_reply` to fix |
 | `failed` | Read `error` + `mcp_codex_process`, then `mcp_codex_reply` with corrective prompt |
-| `interrupted` | `mcp_codex_reply` to resume or `mcp_codex_start` new thread if context is lost |
+| `interrupted` | `mcp_codex_reply` to redirect with corrected prompt |
 
 ## Step 6: Validate Results
 
@@ -575,9 +577,32 @@ Call **`mcp_codex_reply`**:
 
 Repeat validate → reply until acceptance criteria pass or the user intervenes.
 
+### When to Cancel a Runaway Thread
+
+Sometimes a thread goes off the rails — the prompt was ambiguous, Codex misunderstood the scope, or it's making destructive changes. **Don't wait for it to finish**. Cancel immediately, then course-correct with `mcp_codex_reply`.
+
+Typical runaway signals:
+
+- Process trace shows Codex editing files outside the declared scope
+- Codex is stuck in a loop (repeating the same failed command or approach)
+- The diff is ballooning far beyond what the task requires
+- Codex is "fixing" things that weren't broken
+
+```json
+{
+  "thread_id": "<thread_id>"
+}
+```
+
+Call **`mcp_codex_cancel`** to interrupt the active turn. The thread status becomes `interrupted`, a `cancelled` step is appended to the process trace, and late stream events are discarded.
+
+After cancel, **use `mcp_codex_reply` on the same thread** to redirect Codex with a corrective prompt — the conversation context is preserved. Only start a fresh thread if the context itself is the problem (e.g. the original prompt was fundamentally wrong).
+
+> **Cancel ≠ archive.** Cancel stops the current turn so you can correct course with `mcp_codex_reply`; archive removes the thread from project listings after the task is completed and validated.
+
 ## Step 8: Archive Thread
 
-When a thread's work is complete and validated:
+When a thread's work is **completed and validated** — all acceptance criteria passed, code reviewed, tests green — archive it to keep project listings clean:
 
 ```json
 { "thread_id": "<thread_id>" }
@@ -608,6 +633,7 @@ Project: project://abcd1234
 |--------|-------------|------------------|
 | New work unit | `mcp_codex_start` | `description`, `prompt`, `cwd`, `block` |
 | Fix / refine | `mcp_codex_reply` | `thread_id`, `prompt`, `block` |
+| Stop runaway thread | `mcp_codex_cancel` | `thread_id` |
 | Poll progress | `mcp_codex_process` | `thread_id` |
 | List projects | MCP resources | `project://...` |
 | List threads | MCP resource read | `project://{project_id}` |
@@ -621,12 +647,13 @@ Project: project://abcd1234
 ## Rules
 
 1. **Git repo required** — Codex won't run outside a git directory; use `mktemp -d && git init` for scratch
-2. **Use MCP tools only** — `mcp_codex_start` / `reply` / `process` / `archive`，不用裸 CLI
+2. **Use MCP tools only** — `mcp_codex_start` / `reply` / `cancel` / `process` / `archive`，不用裸 CLI
 3. **`block: false` for long or parallel tasks** — monitor with `mcp_codex_process` or project resource
-4. **Don't interfere** — poll patiently, let Codex finish long turns
-5. **Parallel is fine** — multiple threads at once for batch work (worktrees, PR reviews)
-6. **Same thread for fixes** — use `mcp_codex_reply`, not a new thread
-7. **Archive when done** — keep project listings clean
+4. **Cancel early, don't wait** — if a thread is clearly going sideways, `mcp_codex_cancel` immediately, then `mcp_codex_reply` to correct course
+5. **Don't interfere** — poll patiently, let Codex finish long turns (but cancel if runaway)
+6. **Parallel is fine** — multiple threads at once for batch work (worktrees, PR reviews)
+7. **Same thread for fixes** — use `mcp_codex_reply`, not a new thread
+8. **Archive when done** — keep project listings clean
 
 ## Anti-Patterns
 
@@ -634,6 +661,7 @@ Project: project://abcd1234
 - Dumping an entire epic into one thread — split by module.
 - Skipping branch creation — always isolate work.
 - Vague reply prompts — always cite concrete failures.
+- Waiting for a runaway thread to finish — `mcp_codex_cancel` early, then `mcp_codex_reply` to correct.
 - Forgetting to archive — leads to cluttered project thread listings.
 - Blocking on parallel threads — use `block: false` and poll via `mcp_codex_process` or project resource.
 - Polling only at the end — check `mcp_codex_process` or project resource while long turns are running.

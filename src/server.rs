@@ -1,6 +1,7 @@
 use std::{env, sync::Arc};
 
 use codex_app_server_sdk::api::{Codex, SandboxMode, ThreadOptions, TurnOptions};
+use codex_app_server_sdk::protocol::requests::{ThreadReadParams, TurnInterruptParams};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -109,6 +110,13 @@ struct ReplyParams {
     block: bool,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(description = "Arguments for cancelling an in-progress Codex turn.")]
+struct CancelParams {
+    #[schemars(description = "Target thread id with an active turn")]
+    thread_id: String,
+}
+
 fn default_process_rounds() -> u32 {
     3
 }
@@ -147,6 +155,18 @@ struct ReplyResult {
     content: Option<String>,
     #[schemars(description = "Whether the call waited for turn completion")]
     blocked: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[schemars(description = "Result of the cancel tool.")]
+struct CancelResult {
+    #[schemars(description = "Target thread id")]
+    thread_id: String,
+    #[schemars(description = "Whether the active turn was interrupted successfully")]
+    cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Interrupted Codex turn id, if available")]
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -226,6 +246,55 @@ impl CodexMcpServer {
         builder.build()
     }
 
+    async fn read_current_turn_id(&self, thread_id: &str) -> Result<String, String> {
+        let result = self
+            .codex
+            .thread_read(ThreadReadParams {
+                thread_id: thread_id.to_string(),
+                include_turns: Some(true),
+                extra: Default::default(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        result
+            .extra
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(|turns| turns.as_array())
+            .and_then(|turns| {
+                turns.iter().rev().find(|turn| {
+                    turn.get("status")
+                        .and_then(|status| status.as_str())
+                        .is_some_and(|status| {
+                            matches!(
+                                status.to_ascii_lowercase().as_str(),
+                                "active" | "inprogress" | "in_progress" | "pending" | "running"
+                            )
+                        })
+                })
+            })
+            .and_then(|turn| turn.get("id"))
+            .and_then(|turn_id| turn_id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("thread `{thread_id}` has no active turn to cancel"))
+    }
+
+    async fn capture_current_turn_id(&self, thread_id: &str) {
+        match self.read_current_turn_id(thread_id).await {
+            Ok(turn_id) => {
+                self.state
+                    .update_thread(thread_id, |record| {
+                        record.current_turn_id = Some(turn_id);
+                    })
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(thread_id, error, "could not capture active turn id");
+            }
+        }
+    }
+
     async fn track_streamed_turn(
         &self,
         thread_id: &str,
@@ -260,6 +329,10 @@ impl CodexMcpServer {
                     let message = error.to_string();
                     self.state
                         .update_thread(thread_id, |record| {
+                            record.current_turn_id = None;
+                            if record.status == ThreadLifecycle::Interrupted {
+                                return;
+                            }
                             record.status = ThreadLifecycle::Failed;
                             record.error = Some(message.clone());
                         })
@@ -289,10 +362,15 @@ impl CodexMcpServer {
                 .await
                 .map_err(|error| error.to_string())?;
 
+            self.capture_current_turn_id(&thread_id).await;
+
             let response = self.track_streamed_turn(&thread_id, streamed).await?;
 
             self.state
                 .update_thread(&thread_id, |record| {
+                    if record.status == ThreadLifecycle::Interrupted {
+                        return;
+                    }
                     record.status = ThreadLifecycle::Completed;
                     if !response.is_empty() {
                         record.final_response = Some(response.clone());
@@ -382,6 +460,7 @@ impl CodexMcpServer {
 
         let record = ThreadRecord::new(thread_id.clone(), cwd, description);
         self.state.upsert_thread(record).await;
+        self.capture_current_turn_id(&thread_id).await;
 
         let final_response = self
             .track_streamed_turn(&thread_id, streamed)
@@ -390,6 +469,9 @@ impl CodexMcpServer {
 
         self.state
             .update_thread(&thread_id, |record| {
+                if record.status == ThreadLifecycle::Interrupted {
+                    return;
+                }
                 record.status = ThreadLifecycle::Completed;
                 if !final_response.is_empty() {
                     record.final_response = Some(final_response.clone());
@@ -423,6 +505,7 @@ impl CodexMcpServer {
 
         let record = ThreadRecord::new(thread_id.clone(), cwd, description);
         self.state.upsert_thread(record).await;
+        self.capture_current_turn_id(&thread_id).await;
 
         let server = self.clone();
         let thread_id_for_task = thread_id.clone();
@@ -436,6 +519,10 @@ impl CodexMcpServer {
                     server
                         .state
                         .update_thread(&thread_id_for_task, |record| {
+                            record.current_turn_id = None;
+                            if record.status == ThreadLifecycle::Interrupted {
+                                return;
+                            }
                             record.status = ThreadLifecycle::Failed;
                             record.error = Some(message);
                         })
@@ -445,6 +532,9 @@ impl CodexMcpServer {
                     server
                         .state
                         .update_thread(&thread_id_for_task, |record| {
+                            if record.status == ThreadLifecycle::Interrupted {
+                                return;
+                            }
                             record.status = ThreadLifecycle::Completed;
                             if !response.is_empty() {
                                 record.final_response = Some(response);
@@ -536,6 +626,7 @@ impl CodexMcpServer {
         self.state
             .update_thread(&params.thread_id, |record| {
                 record.status = ThreadLifecycle::Running;
+                record.current_turn_id = None;
                 record.process.push(crate::state::ProcessStep {
                     kind: ProcessStepKind::UserReply,
                     summary: truncate(&params.prompt, 120),
@@ -569,6 +660,60 @@ impl CodexMcpServer {
             thread_id: params.thread_id,
             content: None,
             blocked: false,
+        };
+        tool_json_result(&payload)
+    }
+
+    #[tool(
+        title = "Cancel Thread",
+        description = "Interrupt an in-progress Codex thread turn. The thread's status transitions to 'interrupted'. Requires the thread to have an active turn.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<CancelResult>()
+    )]
+    async fn cancel(
+        &self,
+        Parameters(params): Parameters<CancelParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_thread_known(&self.codex, &self.state, &params.thread_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+
+        let stored_turn_id = self
+            .state
+            .get_thread(&params.thread_id)
+            .await
+            .and_then(|record| record.current_turn_id);
+        let turn_id = match stored_turn_id {
+            Some(turn_id) => turn_id,
+            None => self
+                .read_current_turn_id(&params.thread_id)
+                .await
+                .map_err(|error| {
+                    McpError::invalid_params(
+                        error,
+                        Some(json!({ "thread_id": params.thread_id })),
+                    )
+                })?,
+        };
+
+        self.codex
+            .turn_interrupt(TurnInterruptParams {
+                thread_id: params.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                extra: Default::default(),
+            })
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        self.state
+            .update_thread(&params.thread_id, |record| {
+                record.mark_cancelled(&turn_id);
+            })
+            .await;
+
+        let payload = CancelResult {
+            thread_id: params.thread_id,
+            cancelled: true,
+            turn_id: Some(turn_id),
         };
         tool_json_result(&payload)
     }
@@ -637,7 +782,7 @@ impl CodexMcpServer {
 #[tool_handler(
     name = "codex-mcp-server",
     version = "0.1.0",
-    instructions = "Codex MCP server exposing project/thread resources and start/reply/process/archive tools backed by codex app-server."
+    instructions = "Codex MCP server exposing project/thread resources and start/reply/cancel/process/archive tools backed by codex app-server."
 )]
 impl ServerHandler for CodexMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -654,7 +799,7 @@ impl ServerHandler for CodexMcpServer {
         .with_instructions(
             "Use resources/list for projects only; read project://{project_id} to list thread ids for that project. \
              Individual threads use thread://{project_id}/{thread_id}. Thread resources merge local execution state with codex thread/read payloads. \
-             Tools: start, reply, process, archive. Use archive to close a thread and remove it from project listings. \
+             Tools: start, reply, cancel, process, archive. Use cancel to interrupt an active turn; use archive to close a thread and remove it from project listings. \
              Non-blocking start/reply emits notifications/codex/thread/completed. \
              Approval requests emit notifications/codex/approval/request; policy via CODEX_MCP_APPROVAL_POLICY=approve|session|deny.",
         )
@@ -850,12 +995,14 @@ mod tool_schema_tests {
     fn tool_attr_functions_expose_input_schema() {
         assert_input_schema::<Parameters<StartParams>>("start");
         assert_input_schema::<Parameters<ReplyParams>>("reply");
+        assert_input_schema::<Parameters<CancelParams>>("cancel");
         assert_input_schema::<Parameters<ProcessParams>>("process");
         assert_input_schema::<Parameters<ArchiveParams>>("archive");
 
         let tools = [
             CodexMcpServer::start_tool_attr(),
             CodexMcpServer::reply_tool_attr(),
+            CodexMcpServer::cancel_tool_attr(),
             CodexMcpServer::process_tool_attr(),
             CodexMcpServer::archive_tool_attr(),
         ];

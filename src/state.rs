@@ -55,6 +55,7 @@ pub enum ApprovalKind {
 pub enum ProcessStepKind {
     ThreadStarted,
     TurnStarted,
+    Cancelled,
     ItemStarted { item: ThreadItemKind },
     ItemUpdated { item: ThreadItemKind },
     ItemCompleted { item: ThreadItemKind },
@@ -89,6 +90,8 @@ pub struct ThreadRecord {
     pub description: String,
     #[schemars(description = "Current local lifecycle status")]
     pub status: ThreadLifecycle,
+    #[schemars(description = "Currently active Codex turn id, if known")]
+    pub current_turn_id: Option<String>,
     #[schemars(description = "Ordered local execution trace")]
     pub process: Vec<ProcessStep>,
     #[schemars(description = "Latest final agent response, if available")]
@@ -206,6 +209,7 @@ impl ThreadRecord {
             cwd,
             description,
             status: ThreadLifecycle::Starting,
+            current_turn_id: None,
             process: Vec::new(),
             final_response: None,
             error: None,
@@ -221,6 +225,11 @@ impl ThreadRecord {
     }
 
     pub fn push_event(&mut self, event: &ThreadEvent) {
+        if self.status == ThreadLifecycle::Interrupted {
+            self.current_turn_id = None;
+            return;
+        }
+
         let now = chrono_now();
         match event {
             ThreadEvent::ThreadStarted { thread_id } => {
@@ -267,6 +276,7 @@ impl ThreadRecord {
                 });
             }
             ThreadEvent::TurnCompleted { .. } => {
+                self.current_turn_id = None;
                 self.status = ThreadLifecycle::Completed;
                 self.process.push(ProcessStep {
                     kind: ProcessStepKind::TurnCompleted,
@@ -275,6 +285,7 @@ impl ThreadRecord {
                 });
             }
             ThreadEvent::TurnFailed { error } => {
+                self.current_turn_id = None;
                 self.status = ThreadLifecycle::Failed;
                 self.error = Some(error.message.clone());
                 self.process.push(ProcessStep {
@@ -284,6 +295,7 @@ impl ThreadRecord {
                 });
             }
             ThreadEvent::Error { message } => {
+                self.current_turn_id = None;
                 self.status = ThreadLifecycle::Failed;
                 self.error = Some(message.clone());
                 self.process.push(ProcessStep {
@@ -293,6 +305,16 @@ impl ThreadRecord {
                 });
             }
         }
+    }
+
+    pub fn mark_cancelled(&mut self, turn_id: &str) {
+        self.status = ThreadLifecycle::Interrupted;
+        self.current_turn_id = None;
+        self.process.push(ProcessStep {
+            kind: ProcessStepKind::Cancelled,
+            summary: format!("Turn {turn_id} cancelled"),
+            at: chrono_now(),
+        });
     }
 }
 
